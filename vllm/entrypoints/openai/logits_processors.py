@@ -6,6 +6,7 @@ from functools import lru_cache, partial
 from typing import Optional, Union
 
 import torch
+import random
 
 from vllm.sampling_params import LogitsProcessor
 from vllm.transformers_utils.tokenizer import AnyTokenizer
@@ -54,10 +55,41 @@ def logit_bias_logits_processor(
     return logits
 
 
+def xtc_logits_processor(
+    logits: torch.Tensor,
+    threshold: float,
+    probability: float,
+    filter_value: float = -float("Inf"),
+) -> torch.Tensor:
+    """
+    Processor function implementing XTC (cross-threshold candidate) filtering.
+
+    Args:
+        logits (torch.Tensor): The logits to process, shape (batch_size, vocab_size).
+        threshold (float): Probability threshold for filtering.
+        probability (float): Probability of applying the filter (0=no, 1=always).
+        filter_value (float): Value to assign to filtered logits.
+    """
+    if random.random() >= probability:
+        return logits
+
+    sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+    probs = sorted_logits.softmax(dim=-1)
+
+    sorted_indices_to_remove = torch.full_like(probs, False, dtype=torch.bool)
+    sorted_indices_to_remove[..., :-1] = probs[..., 1:] >= threshold
+
+    indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
+    logits = logits.masked_fill(indices_to_remove, filter_value)
+    return logits
+
+
 def get_logits_processors(
     logit_bias: Optional[Union[dict[int, float], dict[str, float]]],
     allowed_token_ids: Optional[list[int]],
     tokenizer: AnyTokenizer,
+    xtc_threshold: Optional[float] = 1,
+    xtc_probability: Optional[float] = 0,
 ) -> list[LogitsProcessor]:
     logits_processors: list[LogitsProcessor] = []
     if logit_bias:
@@ -86,5 +118,11 @@ def get_logits_processors(
         logits_processors.append(
             _get_allowed_token_ids_logits_processor(
                 frozenset(allowed_token_ids), len(tokenizer)))
+
+    if xtc_probability > 0:
+        logits_processors.append(
+            partial(xtc_logits_processor,
+                    threshold=xtc_threshold,
+                    probability=xtc_probability))
 
     return logits_processors

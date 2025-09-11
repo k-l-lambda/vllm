@@ -1854,12 +1854,14 @@ class LLMEngine:
 
         logits_processors = []
 
-        if (sampling_params.logit_bias or sampling_params.allowed_token_ids):
+        if (sampling_params.logit_bias or sampling_params.allowed_token_ids or sampling_params.xtc_probability > 0):
             tokenizer = self.get_tokenizer(lora_request=lora_request)
 
             processors = get_openai_logits_processors(
                 logit_bias=sampling_params.logit_bias,
                 allowed_token_ids=sampling_params.allowed_token_ids,
+                xtc_threshold=sampling_params.xtc_threshold,
+                xtc_probability=sampling_params.xtc_probability,
                 tokenizer=tokenizer)
             logits_processors.extend(processors)
 

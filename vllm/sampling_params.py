@@ -198,6 +198,8 @@ class SamplingParams(
     """If provided, the engine will construct a guided decoding logits
     processor from these parameters."""
     logit_bias: Optional[dict[int, float]] = None
+    xtc_threshold: Optional[float] = None
+    xtc_probability: Optional[float] = None
     """If provided, the engine will construct a logits processor that applies
     these logit biases."""
     allowed_token_ids: Optional[list[int]] = None
@@ -245,6 +247,7 @@ class SamplingParams(
         output_kind: RequestOutputKind = RequestOutputKind.CUMULATIVE,
         guided_decoding: Optional[GuidedDecodingParams] = None,
         logit_bias: Optional[Union[dict[int, float], dict[str, float]]] = None,
+        xtc: Optional[dict[str, float]] = None,
         allowed_token_ids: Optional[list[int]] = None,
         extra_args: Optional[dict[str, Any]] = None,
     ) -> "SamplingParams":
@@ -255,6 +258,10 @@ class SamplingParams(
                 int(token): min(100.0, max(-100.0, bias))
                 for token, bias in logit_bias.items()
             }
+
+        xtc_threshold, xtc_probability = None, None
+        if isinstance(xtc, dict):
+            xtc_threshold, xtc_probability = xtc.get("threshold", 1), xtc.get("probability", 0)
 
         return SamplingParams(
             n=1 if n is None else n,
@@ -287,6 +294,8 @@ class SamplingParams(
             output_kind=output_kind,
             guided_decoding=guided_decoding,
             logit_bias=logit_bias,
+            xtc_threshold=xtc_threshold,
+            xtc_probability=xtc_probability,
             allowed_token_ids=allowed_token_ids,
             extra_args=extra_args,
         )
