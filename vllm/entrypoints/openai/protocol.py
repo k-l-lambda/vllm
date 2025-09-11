@@ -400,6 +400,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
     model: Optional[str] = None
     frequency_penalty: Optional[float] = 0.0
     logit_bias: Optional[dict[str, float]] = None
+    xtc: Optional[dict[str, float]] = None
     logprobs: Optional[bool] = False
     top_logprobs: Optional[int] = 0
     max_tokens: Optional[int] = Field(
@@ -712,6 +713,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
                 else RequestOutputKind.FINAL_ONLY,
             guided_decoding=guided_decoding,
             logit_bias=self.logit_bias,
+            xtc=self.xtc,
             bad_words= self.bad_words,
             allowed_token_ids=self.allowed_token_ids,
             extra_args=extra_args or None,
@@ -953,6 +955,7 @@ class CompletionRequest(OpenAIBaseModel):
     echo: Optional[bool] = False
     frequency_penalty: Optional[float] = 0.0
     logit_bias: Optional[dict[str, float]] = None
+    xtc: Optional[dict[str, float]] = None
     logprobs: Optional[int] = None
     max_tokens: Optional[int] = 16
     n: int = 1
@@ -1198,6 +1201,7 @@ class CompletionRequest(OpenAIBaseModel):
                 else RequestOutputKind.FINAL_ONLY,
             guided_decoding=guided_decoding,
             logit_bias=self.logit_bias,
+            xtc=self.xtc,
             allowed_token_ids=self.allowed_token_ids,
             extra_args=extra_args or None,
             )
