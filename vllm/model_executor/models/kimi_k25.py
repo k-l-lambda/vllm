@@ -457,6 +457,17 @@ class KimiK25ForConditionalGeneration(
         vision_embeddings = self._process_media_input(media_input)
         return vision_embeddings
 
+
+    def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        if hasattr(self.language_model, "set_aux_hidden_state_layers"):
+            self.language_model.set_aux_hidden_state_layers(layers)
+
+    def get_eagle3_aux_hidden_state_layers(self) -> tuple[int, ...]:
+        if hasattr(self.language_model, "get_eagle3_aux_hidden_state_layers"):
+            return self.language_model.get_eagle3_aux_hidden_state_layers()
+        num_layers = self.config.text_config.num_hidden_layers
+        return (2, num_layers // 2, num_layers - 3)
+
     def forward(
         self,
         input_ids: torch.Tensor,
