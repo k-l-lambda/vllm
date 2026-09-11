@@ -112,6 +112,20 @@ class RequestState:
 
         self.draft_tokens[req_idx].zero_()
 
+        # K3BON_PATCH_APPLIED: clear the diverge-token branch latch for this
+        # slot. free_indices recycles slots, so at concurrency 1
+        # consecutive requests share one -- without this only the first
+        # request of each slot would ever branch, and every later row
+        # would read as 'no diverge token found'.
+        try:
+            from vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils import (
+                k3bon_reset_slot,
+            )
+
+            k3bon_reset_slot(req_idx)
+        except Exception:
+            pass
+
     def apply_staged_writes(self) -> None:
         self.prompt_len.copy_to_uva()
         self.prefill_len.copy_to_uva()
