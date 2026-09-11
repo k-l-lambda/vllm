@@ -11,25 +11,32 @@
 # `curl --data-binary @file` does NOT expand shell variables, so an unrendered
 # file registers a job literally named '$JOB_NAME'. Everything is substituted here.
 #
-# WHY THIS IS PINNED, against the eval template's default. That template argues for
-# unpinned and lists node-local weights as verified on all 9 nodes. Both still hold.
-# The reason to pin is the OTHER hazard the same template documents: this cluster
-# runs large inference under nerdctl, OUTSIDE k8s, holding VRAM the scheduler cannot
-# see. Measured 2026-09-11:
-#   host-172-16-1-246   0/8 cards busy   <- genuinely free, and has the corpus
-#   host-172-16-0-54    8/8 cards busy   while k8s reports 0/8 requested
-#   host-172-16-3-229   0/8 cards busy   but NO corpus at all
-# An unpinned 8-GPU job can be placed on 0-54 and contend for VRAM it will not get.
-# So the pin is the template's own rule applied, not an exception to it.
+# UNPINNED, and the two things that would otherwise force a pin are handled in the
+# job rather than by a hostname.
 #
-# The corpus rides on the node, not in the ConfigMap: random.jsonl is 102 MB and
-# 1-246's copy is byte-identical to 2-140's (sha 01a44770..., matching r7's
-# EXPECT_SHA). Shipping 8 gzipped rows would fit the 1 MiB cap but would throw away
-# the other 647 rows the later pilot needs.
+# 1. NODE-LOCAL CORPUS. random.jsonl is 102 MB and exists on only two of the nine
+#    nodes, which is exactly the condition the eval template names as forcing a pin.
+#    So the 8 gate rows ride in the ConfigMap as gzipped binaryData (417 KB, ~40% of
+#    the 1 MiB cap) and no node needs the corpus. The `datasets` mount is therefore
+#    also dropped -- its hostPath may not exist on every node.
+#
+# 2. GPUs THAT ARE NOT ACTUALLY FREE. This cluster runs large inference under
+#    nerdctl, OUTSIDE k8s, holding VRAM the scheduler cannot see. Measured
+#    2026-09-11: host-172-16-0-54 reported 0/8 GPUs requested to k8s while its own
+#    nvidia-smi showed 8/8 cards busy, held by leaked processes from a pod already in
+#    Error. Volcano can place this job there. run_bon_gates.sh therefore reads real
+#    per-card usage first and exits 9 with "PLACEMENT failure" rather than dying in a
+#    CUDA OOM several minutes into a TP8 load, which would read as an engine fault.
+#
+# EXPECT_SHA still names the PARENT corpus, for provenance. It is NOT recomputable
+# from the shipped subset, so ROWS_GZ_SHA pins the subset and the job says which of
+# the two it actually verified.
 set -euo pipefail
 
 : "${JOB_NAME:?set JOB_NAME}"
-: "${PIN_NODE:=host-172-16-1-246}"
+# Empty by default: the job is submitted unpinned. Set PIN_NODE only to recover from
+# an exit-9 placement failure, naming a node verified free by nvidia-smi.
+: "${PIN_NODE:=}"
 : "${GATE_ROWS:=8}"
 : "${GATE_MAX_TOKENS:=128}"
 : "${VLLM_PORT:=19541}"
@@ -37,6 +44,12 @@ set -euo pipefail
 : "${OUT_DIR:=/data/output/results-bon-gates}"
 # r7's corpus sha. Checked in-job so a swapped corpus cannot silently change the run.
 : "${EXPECT_SHA:=01a447704f54c98d3ff9ba1d413b0f261e4f5f12b9339d1be677d2589846f8ba}"
+
+# The gzipped gate rows to ship. Built by:
+#   ssh <node> 'head -8 /data/datasets/k3-h-v6-apivalid-655-c1sweep/random.jsonl \
+#     | gzip -9' > gate-rows.jsonl.gz
+: "${ROWS_GZ_FILE:?set ROWS_GZ_FILE to the gzipped gate rows}"
+[ -s "$ROWS_GZ_FILE" ] || { echo "[render] FATAL missing $ROWS_GZ_FILE" >&2; exit 1; }
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # bench_k3h_block5.py provides snapshot/delta over the engine's Prometheus
@@ -53,6 +66,17 @@ done
 # Indent a file into a YAML block scalar at a fixed depth.
 emit() { sed 's/^/      /' "$1"; }
 
+ROWS_GZ_SHA="$(sha256sum "$ROWS_GZ_FILE" | cut -d' ' -f1)"
+ROWS_B64="$(base64 -w0 "$ROWS_GZ_FILE")"
+ROWS_N="$(zcat "$ROWS_GZ_FILE" | wc -l)"
+# The rows are the unit of work for every arm, so a mismatch between what was
+# packed and what the job will run must be caught here, not read as a short run.
+[ "$ROWS_N" -ge "$GATE_ROWS" ] || {
+  echo "[render] FATAL $ROWS_GZ_FILE holds $ROWS_N rows but GATE_ROWS=$GATE_ROWS" >&2
+  exit 1; }
+echo "[render] rows: $ROWS_N packed, $GATE_ROWS will run, sha $ROWS_GZ_SHA" >&2
+echo "[render] pin: ${PIN_NODE:-<none, unpinned>}" >&2
+
 cat <<YAML
 # Rendered by render-job-bon-gates.sh at $(date -u +%FT%TZ)
 # generation: $RUN_GENERATION
@@ -62,6 +86,10 @@ configMap:
   kind: ConfigMap
   metadata:
     name: $JOB_NAME-cm
+  # binaryData lands as a real binary file in the mount, so the job needs no base64
+  # step and the 1 MiB cap counts the DECODED bytes.
+  binaryData:
+    gate-rows.jsonl.gz: $ROWS_B64
   data:
     run_bon_gates.sh: |
 $(emit "$here/run_bon_gates.sh")
@@ -88,8 +116,12 @@ job:
             labels:
               polaris.novita.ai/app: eval
           spec:
-            nodeSelector:
-              kubernetes.io/hostname: $PIN_NODE
+$(if [ -n "$PIN_NODE" ]; then
+    printf '            nodeSelector:\n              kubernetes.io/hostname: %s\n' "$PIN_NODE"
+  else
+    printf '            # unpinned: placement is the scheduler'"'"'s, and run_bon_gates.sh\n'
+    printf '            # exits 9 if the chosen node'"'"'s cards are not actually free.\n'
+  fi)
             # MANDATORY. Polaris injects no restartPolicy, so the default is
             # Always: kubelet would restart the finished container in place, the
             # pod would never reach Succeeded, Volcano would never emit
@@ -135,8 +167,10 @@ job:
                     value: "101"
                   - name: EXPECT_SHA
                     value: "$EXPECT_SHA"
-                  - name: PROMPTS
-                    value: "/data/datasets/k3-h-v6-apivalid-655-c1sweep"
+                  - name: ROWS_GZ
+                    value: "/etc/job/gate-rows.jsonl.gz"
+                  - name: ROWS_GZ_SHA
+                    value: "$ROWS_GZ_SHA"
                   - name: MAX_LOGPROBS
                     value: "200"
                   - name: VLLM_LOGGING_LEVEL
@@ -158,8 +192,6 @@ job:
                     mountPath: /etc/job-rw
                   - name: models
                     mountPath: /data/models
-                  - name: datasets
-                    mountPath: /data/datasets
                   - name: output
                     mountPath: /data/output
                   - name: job-cm

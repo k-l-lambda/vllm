@@ -31,6 +31,32 @@ exec > >(tee -a "$OUT/driver.log") 2>&1
 echo "[bon] node=$(hostname) start=$(date -u +%FT%TZ) generation=${RUN_GENERATION:-unset}"
 nvidia-smi --query-gpu=index,memory.used --format=csv,noheader
 
+# ---- preflight: the cards must ACTUALLY be free -------------------------------
+# This job is submitted UNPINNED, and on this cluster k8s GPU accounting is not
+# sufficient to know a node is usable: large inference runs under nerdctl, outside
+# Kubernetes, and holds VRAM the scheduler cannot see. Measured 2026-09-11,
+# host-172-16-0-54 reported 0/8 GPUs requested to k8s while nvidia-smi showed 8/8
+# cards busy -- held by leaked processes from a pod already in Error.
+# Without this check, landing there produces a CUDA OOM several minutes into a TP8
+# load, which reads as an engine problem rather than as placement. Fail fast and
+# name the cause instead.
+BUSY_MIB=${BUSY_MIB:-10240}
+BUSY=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits \
+       | awk -v t="$BUSY_MIB" '$1 > t' | wc -l)
+NGPU=$(nvidia-smi --query-gpu=index --format=csv,noheader | wc -l)
+echo "[bon] preflight: $BUSY of $NGPU cards above ${BUSY_MIB} MiB used"
+if [ "$BUSY" -gt 0 ]; then
+  echo "[bon] FATAL this node's GPUs are NOT free. Per-card usage:"
+  nvidia-smi --query-gpu=index,memory.used,memory.total --format=csv | sed 's/^/[bon]   /'
+  echo "[bon]   k8s scheduled this pod here because its GPU accounting shows the"
+  echo "[bon]   node as free, but the cards are held -- most likely by an"
+  echo "[bon]   out-of-cluster nerdctl workload or leaked processes from an Errored"
+  echo "[bon]   pod. This is a PLACEMENT failure, not an engine failure. Resubmit"
+  echo "[bon]   with a nodeSelector for a node verified free by nvidia-smi."
+  exit 9
+fi
+echo "[bon] preflight passed: all $NGPU cards free"
+
 VERIFIER=${VERIFIER:-/data/models/moonshotai/Kimi-K3}
 D_B5=${D_B5:-/data/models/Inferact/Kimi-K3-DSpark-Block5}
 B5_BYTES_EXPECT=5707153178
@@ -106,13 +132,43 @@ PYG1
 [ $? -eq 0 ] || { echo "[bon] FATAL GATE 1 failed"; exit 1; }
 
 # ---- rows: the same corpus as twoseed, so a0u has a known noise floor ---------
-PROMPTS_SRC=${PROMPTS:-/data/datasets/k3-h-v6-apivalid-655-c1sweep}
-ROWS_JSONL="$PROMPTS_SRC/random.jsonl"
-[ -s "$ROWS_JSONL" ] || { echo "[bon] FATAL missing $ROWS_JSONL"; exit 1; }
-if [ -n "${EXPECT_SHA:-}" ]; then
-  S=$(sha256sum "$ROWS_JSONL" | cut -d' ' -f1)
-  [ "$S" = "$EXPECT_SHA" ] || { echo "[bon] FATAL corpus sha $S != $EXPECT_SHA"; exit 1; }
-  echo "[bon] corpus sha verified: $S"
+# Two sources, in this order:
+#   ROWS_GZ   gzipped rows shipped IN THE CONFIGMAP. Preferred, and the reason this
+#             job can run unpinned at all: random.jsonl is 102 MB and exists on only
+#             two of the nine nodes, which would otherwise force a hostname pin.
+#   PROMPTS   the node-local corpus, used when ROWS_GZ is absent (the later pilot
+#             needs all 655 rows, which do not fit the 1 MiB ConfigMap cap).
+# EXPECT_SHA names the PARENT corpus in both cases. When the rows come from the
+# ConfigMap it cannot be recomputed here -- the file is a subset -- so ROWS_GZ_SHA
+# pins the subset instead and EXPECT_SHA is recorded for provenance only. Saying
+# which quantity was actually checked matters: verifying the subset's own hash and
+# calling it a corpus check would be a claim this run cannot support.
+ROWS_GZ=${ROWS_GZ:-}
+if [ -n "$ROWS_GZ" ] && [ -s "$ROWS_GZ" ]; then
+  echo "[bon] rows source: ConfigMap $ROWS_GZ"
+  if [ -n "${ROWS_GZ_SHA:-}" ]; then
+    S=$(sha256sum "$ROWS_GZ" | cut -d' ' -f1)
+    [ "$S" = "$ROWS_GZ_SHA" ] || { echo "[bon] FATAL rows sha $S != $ROWS_GZ_SHA"; exit 1; }
+    echo "[bon] rows sha verified: $S"
+  fi
+  echo "[bon] parent corpus (provenance, NOT verified here): ${EXPECT_SHA:-unset}"
+  ROWS_JSONL="$OUT/rows-src.jsonl"
+  zcat "$ROWS_GZ" > "$ROWS_JSONL" || { echo "[bon] FATAL cannot unpack $ROWS_GZ"; exit 1; }
+  echo "[bon] unpacked $(wc -l < "$ROWS_JSONL") rows"
+else
+  PROMPTS_SRC=${PROMPTS:-/data/datasets/k3-h-v6-apivalid-655-c1sweep}
+  ROWS_JSONL="$PROMPTS_SRC/random.jsonl"
+  [ -s "$ROWS_JSONL" ] || {
+    echo "[bon] FATAL no rows: ROWS_GZ unset/empty and $ROWS_JSONL missing."
+    echo "[bon]   This node has no copy of the corpus. Either ship the rows in the"
+    echo "[bon]   ConfigMap (ROWS_GZ) or pin to a node that holds it."
+    exit 1; }
+  echo "[bon] rows source: node-local $ROWS_JSONL"
+  if [ -n "${EXPECT_SHA:-}" ]; then
+    S=$(sha256sum "$ROWS_JSONL" | cut -d' ' -f1)
+    [ "$S" = "$EXPECT_SHA" ] || { echo "[bon] FATAL corpus sha $S != $EXPECT_SHA"; exit 1; }
+    echo "[bon] corpus sha verified: $S"
+  fi
 fi
 GATE_ROWS=${GATE_ROWS:-8}
 python3 - "$ROWS_JSONL" "$GATE_ROWS" "$OUT/gate-rows.jsonl" <<'PYROWS'
