@@ -160,6 +160,10 @@ class _K3BonState:
     """
 
     N_FIELDS = 12
+    # dump_all is a DIFFERENT width: it records the pre-selection view
+    # (call, slot, pos, h, p_top1, collision, k_nuc, gate, latched) and is
+    # the ONLY stream carrying gate-fired-but-latched, which GATE E needs.
+    N_FIELDS_ALL = 9
 
     def __init__(self):
         self.latched = None
@@ -493,6 +497,12 @@ def patch_states(path: str) -> str:
     if MARK in src:
         return "states: already patched"
 
+    # Module-level flag for the one-shot warning below.
+    if "_K3BON_RESET_WARNED" not in src:
+        src = src.replace(
+            "\nclass RequestState:",
+            "\n_K3BON_RESET_WARNED = False\n\n\nclass RequestState:", 1)
+
     anchor = "        self.draft_tokens[req_idx].zero_()"
     i = _anchor(src, anchor, "add_request slot init", path)
     lines = src.split("\n")
@@ -509,8 +519,23 @@ def patch_states(path: str) -> str:
         "            )\n"
         "\n"
         "            k3bon_reset_slot(req_idx)\n"
-        "        except Exception:\n"
-        "            pass"
+        "        except Exception as e:\n"
+        "            # NEVER silent. A wrong import path here leaves the latch\n"
+        "            # permanently set, and at concurrency 1 that reads as\n"
+        "            # 'only the first request ever branched' -- a plausible\n"
+        "            # experimental result rather than a defect. Warn once so it\n"
+        "            # cannot be mistaken for data, but do not raise: add_request\n"
+        "            # must keep working on an unpatched sampler.\n"
+        "            global _K3BON_RESET_WARNED\n"
+        "            if not _K3BON_RESET_WARNED:\n"
+        "                _K3BON_RESET_WARNED = True\n"
+        "                import logging\n"
+        "\n"
+        "                logging.getLogger(__name__).warning(\n"
+        "                    'K3BON latch reset unavailable (%s); every request '\n"
+        "                    'after the first in a recycled slot will refuse to '\n"
+        "                    'branch. GATE E will read fired >> unlatched.', e\n"
+        "                )"
     )
     lines.insert(i + 1, add)
     src = "\n".join(lines)
